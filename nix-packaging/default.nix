@@ -16,15 +16,14 @@ buildGoModule rec {
     main.version=${version}
   '';
 
-  modSha256 = "0kwwvd979zhdml3shw96cwyh84qn7k7p4yy0qsjiwi9ncnjb1ca6";
-
-  prePatch = ''
+  postPatch = ''
     go-bindata -pkg assets -o assets/assets.go data/
   '';
 
   postInstall = ''
     mkdir -p $lib
     cp -v $src/data/*.nix $lib
+    cp morph $out/
   '';
 
   outputs = [ "out" "lib" ];

@@ -5,37 +5,77 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/DBCDK/morph/healthchecks"
-	"github.com/DBCDK/morph/secrets"
-	"github.com/DBCDK/morph/ssh"
 	"io/ioutil"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
+
+	"github.com/DBCDK/morph/healthchecks"
+	"github.com/DBCDK/morph/secrets"
+	"github.com/DBCDK/morph/ssh"
+	"github.com/DBCDK/morph/utils"
 )
 
 type Host struct {
-	HealthChecks healthchecks.HealthChecks
-	Name         string
-	NixosRelease string
-	TargetHost   string
-	Secrets      map[string]secrets.Secret
-	BuildOnly    bool
+	HealthChecks            healthchecks.HealthChecks
+	Name                    string
+	NixosRelease            string
+	TargetHost              string
+	TargetUser              string
+	Secrets                 map[string]secrets.Secret
+	BuildOnly               bool
+	SubstituteOnDestination bool
+	NixConfig               map[string]string
+	Tags                    []string
+}
+
+type HostOrdering struct {
+	Tags []string
+}
+
+type DeploymentMetadata struct {
+	Description string
+	Ordering    HostOrdering
+}
+
+type Deployment struct {
+	Hosts []Host             `json:"hosts"`
+	Meta  DeploymentMetadata `json:"meta"`
 }
 
 type NixContext struct {
-	EvalMachines string
-	ShowTrace    bool
+	EvalMachines    string
+	ShowTrace       bool
+	KeepGCRoot      bool
+	AllowBuildShell bool
+}
+
+type FileArgs struct {
+	Names []string
+}
+
+func (host *Host) GetName() string {
+	return host.Name
 }
 
 func (host *Host) GetTargetHost() string {
 	return host.TargetHost
 }
 
+func (host *Host) GetTargetUser() string {
+	return host.TargetUser
+}
+
 func (host *Host) GetHealthChecks() healthchecks.HealthChecks {
 	return host.HealthChecks
+}
+
+func (host *Host) GetTags() []string {
+	return host.Tags
 }
 
 func (host *Host) Reboot(sshContext *ssh.SSHContext) error {
@@ -98,10 +138,10 @@ func (host *Host) Reboot(sshContext *ssh.SSHContext) error {
 	return nil
 }
 
-func (ctx *NixContext) GetMachines(deploymentPath string) (hosts []Host, err error) {
+func (ctx *NixContext) GetBuildShell(deploymentPath string) (buildShell *string, err error) {
 
 	args := []string{"eval",
-		"-f", ctx.EvalMachines, "info.machineList",
+		"-f", ctx.EvalMachines, "info.buildShell",
 		"--arg", "networkExpr", deploymentPath,
 		"--json"}
 
@@ -115,47 +155,117 @@ func (ctx *NixContext) GetMachines(deploymentPath string) (hosts []Host, err err
 	cmd.Stdout = &stdout
 	cmd.Stderr = os.Stderr
 
+	utils.AddFinalizer(func() {
+		if (cmd.ProcessState == nil || !cmd.ProcessState.Exited()) && cmd.Process != nil {
+			_ = cmd.Process.Signal(syscall.SIGTERM)
+		}
+	})
 	err = cmd.Run()
 	if err != nil {
 		errorMessage := fmt.Sprintf(
 			"Error while running `nix eval ..`: %s", err.Error(),
 		)
-		return hosts, errors.New(errorMessage)
+		return buildShell, errors.New(errorMessage)
 	}
 
-	err = json.Unmarshal(stdout.Bytes(), &hosts)
+	err = json.Unmarshal(stdout.Bytes(), &buildShell)
 	if err != nil {
-		return hosts, err
+		return nil, err
 	}
 
-	return hosts, nil
+	return buildShell, nil
 }
 
-func (ctx *NixContext) BuildMachines(deploymentPath string, hosts []Host, nixArgs []string, nixBuildTargets string) (path string, err error) {
-	hostsArg := "["
-	for _, host := range hosts {
-		hostsArg += "\"" + host.TargetHost + "\" "
-	}
-	hostsArg += "]"
+func (ctx *NixContext) GetMachines(deploymentPath string) (deployment Deployment, err error) {
 
-	// create tmp dir for result link
+	args := []string{"eval",
+		"-f", ctx.EvalMachines, "info.deployment",
+		"--arg", "networkExpr", deploymentPath,
+		"--json"}
+
+	if ctx.ShowTrace {
+		args = append(args, "--show-trace")
+	}
+
+	cmd := exec.Command("nix", args...)
+
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = os.Stderr
+
+	utils.AddFinalizer(func() {
+		if (cmd.ProcessState == nil || !cmd.ProcessState.Exited()) && cmd.Process != nil {
+			_ = cmd.Process.Signal(syscall.SIGTERM)
+		}
+	})
+	err = cmd.Run()
+	if err != nil {
+		errorMessage := fmt.Sprintf(
+			"Error while running `nix eval ..`: %s", err.Error(),
+		)
+		return deployment, errors.New(errorMessage)
+	}
+
+	err = json.Unmarshal(stdout.Bytes(), &deployment)
+	if err != nil {
+		return deployment, err
+	}
+
+	return deployment, nil
+}
+
+func (ctx *NixContext) BuildMachines(deploymentPath string, hosts []Host, nixArgs []string, nixBuildTargets string) (resultPath string, err error) {
 	tmpdir, err := ioutil.TempDir("", "morph-")
 	if err != nil {
 		return "", err
 	}
-	defer os.Remove(tmpdir)
+	utils.AddFinalizer(func() {
+		os.RemoveAll(tmpdir)
+	})
 
-	resultLinkPath := filepath.Join(tmpdir, "result")
+	hostsArg := []string{}
+	for _, host := range hosts {
+		hostsArg = append(hostsArg, host.Name)
+	}
 
+	fileArgs := FileArgs{
+		Names: hostsArg,
+	}
+
+	jsonArgs, err := json.Marshal(fileArgs)
+	if err != nil {
+		return "", err
+	}
+	argsFile := tmpdir + "/morph-args.json"
+
+	err = ioutil.WriteFile(argsFile, jsonArgs, 0644)
+	if err != nil {
+		return "", err
+	}
+
+	resultLinkPath := filepath.Join(path.Dir(deploymentPath), ".gcroots", path.Base(deploymentPath))
+	if ctx.KeepGCRoot {
+		if err = os.MkdirAll(path.Dir(resultLinkPath), 0755); err != nil {
+			ctx.KeepGCRoot = false
+			fmt.Fprintf(os.Stderr, "Unable to create GC root, skipping: %s", err)
+		}
+	}
+	if !ctx.KeepGCRoot {
+		// create tmp dir for result link
+		resultLinkPath = filepath.Join(tmpdir, "result")
+	}
 	args := []string{ctx.EvalMachines,
 		"-A", "machines",
 		"--arg", "networkExpr", deploymentPath,
-		"--arg", "names", hostsArg,
+		"--argstr", "argsFile", argsFile,
 		"--out-link", resultLinkPath}
+
+	args = append(args, mkOptions(hosts[0])...)
 
 	if len(nixArgs) > 0 {
 		args = append(args, nixArgs...)
 	}
+
 	if ctx.ShowTrace {
 		args = append(args, "--show-trace")
 	}
@@ -165,27 +275,56 @@ func (ctx *NixContext) BuildMachines(deploymentPath string, hosts []Host, nixArg
 			"--arg", "buildTargets", nixBuildTargets)
 	}
 
-	cmd := exec.Command("nix-build", args...)
-	defer os.Remove(resultLinkPath)
+	buildShell, err := ctx.GetBuildShell(deploymentPath)
+
+	if err != nil {
+		errorMessage := fmt.Sprintf(
+			"Error getting buildShell.",
+		)
+		return resultPath, errors.New(errorMessage)
+	}
+
+	var cmd *exec.Cmd
+	if ctx.AllowBuildShell && buildShell != nil {
+		shellArgs := strings.Join(append([]string{"nix-build"}, args...), " ")
+		cmd = exec.Command("nix-shell", *buildShell, "--run", shellArgs)
+	} else {
+		cmd = exec.Command("nix-build", args...)
+	}
 
 	// show process output on attached stdout/stderr
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
+	utils.AddFinalizer(func() {
+		if (cmd.ProcessState == nil || !cmd.ProcessState.Exited()) && cmd.Process != nil {
+			_ = cmd.Process.Signal(syscall.SIGTERM)
+		}
+	})
 	err = cmd.Run()
 
 	if err != nil {
 		errorMessage := fmt.Sprintf(
-			"Error while running `nix build ...`: See above.",
+			"Error while running `%s ...`: See above.", cmd.String(),
 		)
-		return path, errors.New(errorMessage)
+		return resultPath, errors.New(errorMessage)
 	}
 
-	resultPath, err := os.Readlink(resultLinkPath)
+	resultPath, err = os.Readlink(resultLinkPath)
 	if err != nil {
 		return "", err
 	}
 
-	return resultPath, nil
+	return
+}
+
+func mkOptions(host Host) []string {
+	var options = make([]string, 0)
+	for k, v := range host.NixConfig {
+		options = append(options, "--option")
+		options = append(options, k)
+		options = append(options, v)
+	}
+	return options
 }
 
 func GetNixSystemPath(host Host, resultPath string) (string, error) {
@@ -202,32 +341,45 @@ func GetPathsToPush(host Host, resultPath string) (paths []string, err error) {
 		return paths, err
 	}
 
-	path2, err := GetNixSystemDerivation(host, resultPath)
-	if err != nil {
-		return paths, err
-	}
-
-	paths = append(paths, path1, path2)
+	paths = append(paths, path1)
 
 	return paths, nil
 }
 
 func Push(ctx *ssh.SSHContext, host Host, paths ...string) (err error) {
+	utils.ValidateEnvironment("ssh")
+
 	var userArg = ""
 	var keyArg = ""
-	if ctx.Username != "" {
-		userArg = ctx.Username + "@"
+	var env = os.Environ()
+	if host.TargetUser != "" {
+		userArg = host.TargetUser + "@"
+	} else if ctx.DefaultUsername != "" {
+		userArg = ctx.DefaultUsername + "@"
 	}
 	if ctx.IdentityFile != "" {
 		keyArg = "?ssh-key=" + ctx.IdentityFile
 	}
+	if ctx.SkipHostKeyCheck {
+		env = append(env, fmt.Sprintf("NIX_SSHOPTS=%s", "-o StrictHostkeyChecking=No -o UserKnownHostsFile=/dev/null"))
+	}
 
+	options := mkOptions(host)
 	for _, path := range paths {
-		cmd := exec.Command(
-			"nix", "copy",
+		args := []string{
+			"copy",
 			path,
-			"--to", "ssh://"+userArg+host.TargetHost+keyArg,
+			"--to", "ssh://" + userArg + host.TargetHost + keyArg,
+		}
+		args = append(args, options...)
+		if host.SubstituteOnDestination {
+			args = append(args, "--substitute-on-destination")
+		}
+
+		cmd := exec.Command(
+			"nix", args...,
 		)
+		cmd.Env = env
 
 		cmd.Stdout = os.Stderr
 		cmd.Stderr = os.Stderr

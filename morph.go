@@ -4,6 +4,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+
 	"github.com/DBCDK/kingpin"
 	"github.com/DBCDK/morph/assets"
 	"github.com/DBCDK/morph/filter"
@@ -12,11 +16,6 @@ import (
 	"github.com/DBCDK/morph/secrets"
 	"github.com/DBCDK/morph/ssh"
 	"github.com/DBCDK/morph/utils"
-	"io/ioutil"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"strings"
 )
 
 // This is set at build time via -ldflags magic
@@ -27,18 +26,20 @@ var (
 	app                 = kingpin.New("morph", "NixOS host manager").Version(version)
 	dryRun              = app.Flag("dry-run", "Don't do anything, just eval and print changes").Default("False").Bool()
 	selectGlob          string
+	selectTags          string
 	selectEvery         int
 	selectSkip          int
 	selectLimit         int
+	orderingTags        string
 	deployment          string
 	timeout             int
 	askForSudoPasswd    bool
 	nixBuildArg         []string
 	nixBuildTarget      string
 	nixBuildTargetFile  string
-	build               = buildCmd(app.Command("build", "Build machines"))
-	push                = pushCmd(app.Command("push", "Push machines"))
-	deploy              = deployCmd(app.Command("deploy", "Deploy machines"))
+	build               = buildCmd(app.Command("build", "Evaluate and build deployment configuration to the local Nix store"))
+	push                = pushCmd(app.Command("push", "Build and transfer items from the local Nix store to target machines"))
+	deploy              = deployCmd(app.Command("deploy", "Build, push and activate new configuration on machines according to switch-action"))
 	deploySwitchAction  string
 	deployUploadSecrets bool
 	deployReboot        bool
@@ -50,9 +51,10 @@ var (
 	asJson              bool
 	execute             = executeCmd(app.Command("exec", "Execute arbitrary commands on machines"))
 	executeCommand      []string
+	keepGCRoot          = app.Flag("keep-result", "Keep latest build in .gcroots to prevent it from being garbage collected").Default("False").Bool()
+	allowBuildShell     = app.Flag("allow-build-shell", "Allow using `network.buildShell` to build in a nix-shell which can execute arbitrary commands on the local system").Default("False").Bool()
 
-	tempDir, tempDirErr  = ioutil.TempDir("", "morph-")
-	assetRoot, assetsErr = assets.Setup()
+	assetRoot string
 )
 
 func deploymentArg(cmd *kingpin.CmdClause) {
@@ -79,6 +81,9 @@ func selectorFlags(cmd *kingpin.CmdClause) {
 	cmd.Flag("on", "Glob for selecting servers in the deployment").
 		Default("*").
 		StringVar(&selectGlob)
+	cmd.Flag("tagged", "Select hosts with these tags").
+		Default("").
+		StringVar(&selectTags)
 	cmd.Flag("every", "Select every n hosts").
 		Default("1").
 		IntVar(&selectEvery)
@@ -87,6 +92,9 @@ func selectorFlags(cmd *kingpin.CmdClause) {
 		IntVar(&selectSkip)
 	cmd.Flag("limit", "Select at most n hosts").
 		IntVar(&selectLimit)
+	cmd.Flag("order-by-tags", "Order hosts by tags (comma separated list)").
+		Default("").
+		StringVar(&orderingTags)
 }
 
 func nixBuildArgFlag(cmd *kingpin.CmdClause) {
@@ -170,7 +178,7 @@ func deployCmd(cmd *kingpin.CmdClause) *kingpin.CmdClause {
 		Default("False").
 		BoolVar(&deployUploadSecrets)
 	cmd.
-		Flag("reboot", "Reboots the host after system activation, but before healthchecks as executed.").
+		Flag("reboot", "Reboots the host after system activation, but before healthchecks has executed.").
 		Default("False").
 		BoolVar(&deployReboot)
 	cmd.
@@ -206,19 +214,17 @@ func listSecretsCmd(cmd *kingpin.CmdClause) *kingpin.CmdClause {
 	return cmd
 }
 
-func init() {
-	if err := validateEnvironment(); err != nil {
-		panic(err)
-	}
+func setup() {
+	utils.ValidateEnvironment("nix")
 
-	if assetsErr != nil {
-		fmt.Fprintln(os.Stderr, "Error unpacking assets:")
-		panic(assetsErr)
-	}
+	utils.AddFinalizer(func() {
+		assets.Teardown(assetRoot)
+	})
+	utils.SignalHandler()
 
-	if tempDirErr != nil {
-		panic(tempDirErr)
-	}
+	var assetErr error
+	assetRoot, assetErr = assets.Setup()
+	handleError(assetErr)
 }
 
 func main() {
@@ -230,10 +236,11 @@ func main() {
 		fmt.Fprintln(os.Stderr, "Deprecation: The --build-arg flag will be removed in a future release.")
 	}
 
+	defer utils.RunFinalizers()
+	setup()
+
 	hosts, err := getHosts(deployment)
-	if err != nil {
-		handleError(clause, hosts, err)
-	}
+	handleError(err)
 
 	switch clause {
 	case build.FullCommand():
@@ -256,17 +263,15 @@ func main() {
 		err = execExecute(hosts)
 	}
 
-	if err != nil {
-		handleError(clause, hosts, err)
-	}
-
-	assets.Teardown(assetRoot)
+	handleError(err)
 }
 
-func handleError(cmd string, hosts []nix.Host, err error) {
+func handleError(err error) {
 	//Stupid handling of catch-all errors for now
-	fmt.Fprint(os.Stderr, err.Error())
-	os.Exit(1)
+	if err != nil {
+		fmt.Fprint(os.Stderr, err.Error())
+		utils.Exit(1)
+	}
 }
 
 func execExecute(hosts []nix.Host) error {
@@ -274,7 +279,7 @@ func execExecute(hosts []nix.Host) error {
 
 	for _, host := range hosts {
 		if host.BuildOnly {
-			fmt.Fprintf(os.Stderr, "Exec is disabled for build-only host: %s\n", host.TargetHost)
+			fmt.Fprintf(os.Stderr, "Exec is disabled for build-only host: %s\n", host.Name)
 			continue
 		}
 		fmt.Fprintln(os.Stderr, "** "+host.Name)
@@ -336,7 +341,7 @@ func execDeploy(hosts []nix.Host) (string, error) {
 
 	for _, host := range hosts {
 		if host.BuildOnly {
-			fmt.Fprintf(os.Stderr, "Deployment steps are disabled for build-only host: %s\n", host.TargetHost)
+			fmt.Fprintf(os.Stderr, "Deployment steps are disabled for build-only host: %s\n", host.Name)
 			continue
 		}
 
@@ -379,11 +384,11 @@ func execDeploy(hosts []nix.Host) (string, error) {
 			if err != nil {
 				fmt.Fprintln(os.Stderr)
 				fmt.Fprintln(os.Stderr, "Not deploying to additional hosts, since a host health check failed.")
-				os.Exit(1)
+				utils.Exit(1)
 			}
 		}
 
-		fmt.Fprintln(os.Stderr, "Done:", host.TargetHost)
+		fmt.Fprintln(os.Stderr, "Done:", host.Name)
 	}
 
 	return resultPath, nil
@@ -393,8 +398,9 @@ func createSSHContext() *ssh.SSHContext {
 	return &ssh.SSHContext{
 		AskForSudoPassword: askForSudoPasswd,
 		IdentityFile:       os.Getenv("SSH_IDENTITY_FILE"),
-		Username:           os.Getenv("SSH_USER"),
+		DefaultUsername:    os.Getenv("SSH_USER"),
 		SkipHostKeyCheck:   os.Getenv("SSH_SKIP_HOST_KEY_CHECK") != "",
+		ConfigFile:         os.Getenv("SSH_CONFIG_FILE"),
 	}
 }
 
@@ -404,7 +410,7 @@ func execHealthCheck(hosts []nix.Host) error {
 	var err error
 	for _, host := range hosts {
 		if host.BuildOnly {
-			fmt.Fprintf(os.Stderr, "Healthchecks are disabled for build-only host: %s\n", host.TargetHost)
+			fmt.Fprintf(os.Stderr, "Healthchecks are disabled for build-only host: %s\n", host.Name)
 			continue
 		}
 		err = healthchecks.Perform(sshContext, &host, timeout)
@@ -420,7 +426,7 @@ func execHealthCheck(hosts []nix.Host) error {
 func execUploadSecrets(sshContext *ssh.SSHContext, hosts []nix.Host) error {
 	for _, host := range hosts {
 		if host.BuildOnly {
-			fmt.Fprintf(os.Stderr, "Secret upload is disabled for build-only host: %s\n", host.TargetHost)
+			fmt.Fprintf(os.Stderr, "Secret upload is disabled for build-only host: %s\n", host.Name)
 			continue
 		}
 		singleHostInList := []nix.Host{host}
@@ -485,51 +491,48 @@ func execListSecretsAsJson(hosts []nix.Host) error {
 	return nil
 }
 
-func validateEnvironment() (err error) {
-	dependencies := []string{"nix", "scp", "ssh"}
-	missingDepencies := make([]string, 0)
-	for _, dependency := range dependencies {
-		_, err := exec.LookPath(dependency)
-		if err != nil {
-			missingDepencies = append(missingDepencies, dependency)
-		}
-	}
+func getHosts(deploymentPath string) (hosts []nix.Host, err error) {
 
-	if len(missingDepencies) > 0 {
-		return errors.New("Missing dependencies: " + strings.Join(missingDepencies, ", "))
-	}
-
-	return nil
-}
-
-func getHosts(deploymentFile string) (hosts []nix.Host, err error) {
-
-	deployment, err := os.Open(deploymentFile)
+	deploymentFile, err := os.Open(deploymentPath)
 	if err != nil {
 		return hosts, err
 	}
 
-	deploymentPath, err := filepath.Abs(deployment.Name())
+	deploymentAbsPath, err := filepath.Abs(deploymentFile.Name())
 	if err != nil {
 		return hosts, err
 	}
 
 	ctx := getNixContext()
-	allHosts, err := ctx.GetMachines(deploymentPath)
+	deployment, err := ctx.GetMachines(deploymentAbsPath)
 	if err != nil {
 		return hosts, err
 	}
 
-	matchingHosts, err := filter.MatchHosts(allHosts, selectGlob)
+	matchingHosts, err := filter.MatchHosts(deployment.Hosts, selectGlob)
 	if err != nil {
 		return hosts, err
 	}
 
-	filteredHosts := filter.FilterHosts(matchingHosts, selectSkip, selectEvery, selectLimit)
+	var selectedTags []string
+	if selectTags != "" {
+		selectedTags = strings.Split(selectTags, ",")
+	}
 
-	fmt.Fprintf(os.Stderr, "Selected %v/%v hosts (name filter:-%v, limits:-%v):\n", len(filteredHosts), len(allHosts), len(allHosts)-len(matchingHosts), len(matchingHosts)-len(filteredHosts))
+	matchingHosts2 := filter.FilterHostsTags(matchingHosts, selectedTags)
+
+	ordering := deployment.Meta.Ordering
+	if orderingTags != "" {
+		ordering = nix.HostOrdering{Tags: strings.Split(orderingTags, ",")}
+	}
+
+	sortedHosts := filter.SortHosts(matchingHosts2, ordering)
+
+	filteredHosts := filter.FilterHosts(sortedHosts, selectSkip, selectEvery, selectLimit)
+
+	fmt.Fprintf(os.Stderr, "Selected %v/%v hosts (name filter:-%v, limits:-%v):\n", len(filteredHosts), len(deployment.Hosts), len(deployment.Hosts)-len(matchingHosts), len(matchingHosts)-len(filteredHosts))
 	for index, host := range filteredHosts {
-		fmt.Fprintf(os.Stderr, "\t%3d: %s (secrets: %d, health checks: %d)\n", index, host.TargetHost, len(host.Secrets), len(host.HealthChecks.Cmd)+len(host.HealthChecks.Http))
+		fmt.Fprintf(os.Stderr, "\t%3d: %s (secrets: %d, health checks: %d, tags: %s)\n", index, host.Name, len(host.Secrets), len(host.HealthChecks.Cmd)+len(host.HealthChecks.Http), strings.Join(host.GetTags(), ","))
 	}
 	fmt.Fprintln(os.Stderr)
 
@@ -538,8 +541,10 @@ func getHosts(deploymentFile string) (hosts []nix.Host, err error) {
 
 func getNixContext() *nix.NixContext {
 	return &nix.NixContext{
-		EvalMachines: filepath.Join(assetRoot, "eval-machines.nix"),
-		ShowTrace:    showTrace,
+		EvalMachines:    filepath.Join(assetRoot, assets.Friendly, "eval-machines.nix"),
+		ShowTrace:       showTrace,
+		KeepGCRoot:      *keepGCRoot,
+		AllowBuildShell: *allowBuildShell,
 	}
 }
 
@@ -578,7 +583,7 @@ func buildHosts(hosts []nix.Host) (resultPath string, err error) {
 func pushPaths(sshContext *ssh.SSHContext, filteredHosts []nix.Host, resultPath string) error {
 	for _, host := range filteredHosts {
 		if host.BuildOnly {
-			fmt.Fprintf(os.Stderr, "Push is disabled for build-only host: %s\n", host.TargetHost)
+			fmt.Fprintf(os.Stderr, "Push is disabled for build-only host: %s\n", host.Name)
 			continue
 		}
 
@@ -586,7 +591,7 @@ func pushPaths(sshContext *ssh.SSHContext, filteredHosts []nix.Host, resultPath 
 		if err != nil {
 			return err
 		}
-		fmt.Fprintf(os.Stderr, "Pushing paths to %v:\n", host.TargetHost)
+		fmt.Fprintf(os.Stderr, "Pushing paths to %v (%v@%v):\n", host.Name, host.TargetUser, host.TargetHost)
 		for _, path := range paths {
 			fmt.Fprintf(os.Stderr, "\t* %s\n", path)
 		}
@@ -604,7 +609,7 @@ func secretsUpload(ctx ssh.Context, filteredHosts []nix.Host) error {
 	// relative paths are resolved relative to the deployment file (!)
 	deploymentDir := filepath.Dir(deployment)
 	for _, host := range filteredHosts {
-		fmt.Fprintf(os.Stderr, "Uploading secrets to %s:\n", host.TargetHost)
+		fmt.Fprintf(os.Stderr, "Uploading secrets to %s (%s):\n", host.Name, host.TargetHost)
 		postUploadActions := make(map[string][]string, 0)
 		for secretName, secret := range host.Secrets {
 			secretSize, err := secrets.GetSecretSize(secret, deploymentDir)
@@ -646,7 +651,7 @@ func activateConfiguration(ctx ssh.Context, filteredHosts []nix.Host, resultPath
 	fmt.Fprintln(os.Stderr)
 	for _, host := range filteredHosts {
 
-		fmt.Fprintln(os.Stderr, "** "+host.TargetHost)
+		fmt.Fprintln(os.Stderr, "** "+host.Name)
 
 		configuration, err := nix.GetNixSystemPath(host, resultPath)
 		if err != nil {

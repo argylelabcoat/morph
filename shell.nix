@@ -1,7 +1,18 @@
 let
+  # nixpkgsSrc = builtins.fetchTarball {
+  #   url = "https://github.com/NixOS/nixpkgs/archive/52dae14f0c763dd48572058f0f0906166da14c31.tar.gz";
+  #   sha256 = "13bnnf4w3jm3cbny2hghrafblbxgxccalc12bpy141vkx2f4qb5a";
+  # };
+  sources = import ./nix/sources.nix;
   nixpkgsSrc = builtins.fetchTarball {
-    url = "https://github.com/NixOS/nixpkgs/archive/52dae14f0c763dd48572058f0f0906166da14c31.tar.gz";
-    sha256 = "13bnnf4w3jm3cbny2hghrafblbxgxccalc12bpy141vkx2f4qb5a";
+    url = "https://github.com/NixOS/nixpkgs/archive/06ce0d954b659c60221ee1dda5270a083e52e681.tar.gz";
+    sha256 = "0cjsmrs5jr7xv6x48m2ynny6xik3jwypsn2d5hchxavxa13wcaf5";
+  };
+  # nixpkgs = sources.nixpkgs;
+  pkgs = import nixpkgsSrc {
+    overlays = [
+      (_: _: { inherit sources; })
+    ];
   };
 in
 
